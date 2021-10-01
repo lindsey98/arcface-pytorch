@@ -18,7 +18,7 @@ from test import *
 import  dataset
 from dataset import sampler
 from torch.utils.data.sampler import BatchSampler
-
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 
 def save_model(model, save_path, name, iter_cnt):
@@ -77,7 +77,6 @@ if __name__ == '__main__':
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-
     model = resnet50()
 
     if opt.metric == 'add_margin':
@@ -90,9 +89,9 @@ if __name__ == '__main__':
         metric_fc = nn.Linear(2048, opt.num_classes)
 
     model.to(device)
-    model = DataParallel(model)
     metric_fc.to(device)
-    metric_fc = DataParallel(metric_fc)
+    # model = DataParallel(model)
+    # metric_fc = DataParallel(metric_fc)
 
     if opt.optimizer == 'sgd':
         optimizer = torch.optim.SGD([{'params': model.parameters()}, {'params': metric_fc.parameters()}],
@@ -101,7 +100,7 @@ if __name__ == '__main__':
         optimizer = torch.optim.Adam([{'params': model.parameters()}, {'params': metric_fc.parameters()}],
                                      lr=opt.lr, weight_decay=opt.weight_decay)
     scheduler = StepLR(optimizer, step_size=opt.lr_step, gamma=0.1)
-    evaluate(model, dl_ev, eval_nmi=True, recall_list=[1, 2, 4, 8])
+    # evaluate(model, dl_ev, eval_nmi=False, recall_list=[1, 2, 4, 8])
 
     for i in range(opt.max_epoch):
         scheduler.step()
@@ -121,10 +120,10 @@ if __name__ == '__main__':
             iters = i * len(dl_tr) + ii
 
             if iters % opt.print_freq == 0:
-                evaluate(model, dl_ev, eval_nmi=True, recall_list=[1, 2, 4, 8])
+                evaluate(model, dl_ev, eval_nmi=False, recall_list=[1, 2, 4, 8])
 
         if i % opt.save_interval == 0 or i == opt.max_epoch:
             save_model(model, opt.checkpoints_path, opt.backbone, i)
 
         model.eval()
-        evaluate(model, dl_ev, eval_nmi=True, recall_list=[1, 2, 4, 8])
+        evaluate(model, dl_ev, eval_nmi=False, recall_list=[1, 2, 4, 8])

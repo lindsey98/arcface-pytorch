@@ -15,6 +15,7 @@ from config import Config
 from torch.nn import DataParallel
 from tqdm import tqdm
 import evaluation
+from evaluation.recall import recall_at_ks
 
 
 def get_lfw_list(pair_list):
@@ -179,7 +180,7 @@ def lfw_test(model, img_paths, identity_list, compair_list, batch_size):
     return acc
 
 
-def evaluate(model, dataloader, eval_nmi=True, recall_list=[1, 2, 4, 8]):
+def evaluate(model, dataloader, eval_nmi=False, recall_list=[1, 2, 4, 8]):
     '''
         Evaluation on dataloader
         :param model: embedding model
@@ -194,35 +195,7 @@ def evaluate(model, dataloader, eval_nmi=True, recall_list=[1, 2, 4, 8]):
     X, T, *_ = predict_batchwise(model, dataloader)
     print('done collecting prediction')
 
-    if eval_nmi:
-        # calculate NMI with kmeans clustering
-        nmi = evaluation.calc_normalized_mutual_information(
-            T,
-            evaluation.cluster_by_kmeans(
-                X, nb_classes
-            )
-        )
-    else:
-        nmi = 1
-
-    print("NMI: {:.3f}".format(nmi * 100))
-
-    # get predictions by assigning nearest 8 neighbors with euclidian
-    max_dist = max(recall_list)
-    Y = evaluation.assign_by_euclidian_at_k(X, T, max_dist)
-    Y = torch.from_numpy(Y)
-
-    # calculate recall @ 1, 2, 4, 8
-    recall = []
-    for k in recall_list:
-        r_at_k = evaluation.calc_recall_at_k(T, Y, k)
-        recall.append(r_at_k)
-        print("R@{} : {:.3f}".format(k, 100 * r_at_k))
-
-    chmean = (2 * nmi * recall[0]) / (nmi + recall[0])
-    print("hmean: %s", str(chmean))
-
-    eval_time = time.time() - eval_time
-    print('Eval time: %.2f' % eval_time)
+    nmi, recall = recall_at_ks(X, T, ks=[1, 2, 4, 8])
+    print("Recall@1,2,4,8 {:.3f}, {:.3f}, {:.3f}, {:.3f}".format(recall[1], recall[2], recall[4], recall[8]))
     return nmi, recall
 
