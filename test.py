@@ -6,13 +6,15 @@ Created on 18-5-30 下午4:55
 """
 from __future__ import print_function
 import os
-import cv2
+# import cv2
 from models import *
 import torch
 import numpy as np
 import time
 from config import Config
 from torch.nn import DataParallel
+from tqdm import tqdm
+import evaluation
 
 
 def get_lfw_list(pair_list):
@@ -30,20 +32,20 @@ def get_lfw_list(pair_list):
     return data_list
 
 
-def load_image(img_path):
-    image = cv2.imread(img_path, 0)
-    if image is None:
-        return None
-    image = np.dstack((image, np.fliplr(image)))
-    image = image.transpose((2, 0, 1))
-    image = image[:, np.newaxis, :, :]
-    image = image.astype(np.float32, copy=False)
-    image -= 127.5
-    image /= 127.5
-    return image
+# def load_image(img_path):
+#     image = cv2.imread(img_path, 0)
+#     if image is None:
+#         return None
+#     image = np.dstack((image, np.fliplr(image)))
+#     image = image.transpose((2, 0, 1))
+#     image = image[:, np.newaxis, :, :]
+#     image = image.astype(np.float32, copy=False)
+#     image -= 127.5
+#     image /= 127.5
+#     return image
 
-
-def get_featurs(model, test_list, batch_size=10):
+@torch.no_grad()
+def get_features(model, test_list, batch_size=10):
     images = None
     features = None
     cnt = 0
@@ -78,6 +80,35 @@ def get_featurs(model, test_list, batch_size=10):
             images = None
 
     return features, cnt
+
+def predict_batchwise(model, dataloader):
+    '''
+        Predict on a batch
+        :return: list with N lists, where N = |{image, label, index}|
+    '''
+    # print(list(model.parameters())[0].device)
+    model_is_training = model.training
+    model.eval()
+    ds = dataloader.dataset
+    A = [[] for i in range(len(ds[0]))]
+    with torch.no_grad():
+        # extract batches (A becomes list of samples)
+        for batch in tqdm(dataloader, desc="Batch-wise prediction"):
+            for i, J in enumerate(batch):
+                # i = 0: sz_batch * images
+                # i = 1: sz_batch * labels
+                # i = 2: sz_batch * indices
+                if i == 0:
+                    # move images to device of model (approximate device)
+                    J = J.to(list(model.parameters())[0].device)
+                    # predict model output for image
+                    J = model(J).cpu()
+                for j in J:
+                    #if i == 1: print(j)
+                    A[i].append(j)
+    model.train()
+    model.train(model_is_training) # revert to previous training state
+    return [torch.stack(A[i]) for i in range(len(A))]
 
 
 def load_model(model, model_path):
@@ -138,7 +169,7 @@ def test_performance(fe_dict, pair_list):
 
 def lfw_test(model, img_paths, identity_list, compair_list, batch_size):
     s = time.time()
-    features, cnt = get_featurs(model, img_paths, batch_size=batch_size)
+    features, cnt = get_features(model, img_paths, batch_size=batch_size)
     print(features.shape)
     t = time.time() - s
     print('total time is {}, average time is {}'.format(t, t / cnt))
@@ -148,27 +179,50 @@ def lfw_test(model, img_paths, identity_list, compair_list, batch_size):
     return acc
 
 
-if __name__ == '__main__':
+def evaluate(model, dataloader, eval_nmi=True, recall_list=[1, 2, 4, 8]):
+    '''
+        Evaluation on dataloader
+        :param model: embedding model
+        :param dataloader: dataloader
+        :param eval_nmi: evaluate NMI (Mutual information between clustering on embedding and the gt class labels) or not
+        :param recall_list: recall@K
+    '''
+    eval_time = time.time()
+    nb_classes = dataloader.dataset.nb_classes()
 
-    opt = Config()
-    if opt.backbone == 'resnet18':
-        model = resnet_face18(opt.use_se)
-    elif opt.backbone == 'resnet34':
-        model = resnet34()
-    elif opt.backbone == 'resnet50':
-        model = resnet50()
+    # calculate embeddings with model and get targets
+    X, T, *_ = predict_batchwise(model, dataloader)
+    print('done collecting prediction')
 
-    model = DataParallel(model)
-    # load_model(model, opt.test_model_path)
-    model.load_state_dict(torch.load(opt.test_model_path))
-    model.to(torch.device("cuda"))
+    if eval_nmi:
+        # calculate NMI with kmeans clustering
+        nmi = evaluation.calc_normalized_mutual_information(
+            T,
+            evaluation.cluster_by_kmeans(
+                X, nb_classes
+            )
+        )
+    else:
+        nmi = 1
 
-    identity_list = get_lfw_list(opt.lfw_test_list)
-    img_paths = [os.path.join(opt.lfw_root, each) for each in identity_list]
+    print("NMI: {:.3f}".format(nmi * 100))
 
-    model.eval()
-    lfw_test(model, img_paths, identity_list, opt.lfw_test_list, opt.test_batch_size)
+    # get predictions by assigning nearest 8 neighbors with euclidian
+    max_dist = max(recall_list)
+    Y = evaluation.assign_by_euclidian_at_k(X, T, max_dist)
+    Y = torch.from_numpy(Y)
 
+    # calculate recall @ 1, 2, 4, 8
+    recall = []
+    for k in recall_list:
+        r_at_k = evaluation.calc_recall_at_k(T, Y, k)
+        recall.append(r_at_k)
+        print("R@{} : {:.3f}".format(k, 100 * r_at_k))
 
+    chmean = (2 * nmi * recall[0]) / (nmi + recall[0])
+    print("hmean: %s", str(chmean))
 
+    eval_time = time.time() - eval_time
+    print('Eval time: %.2f' % eval_time)
+    return nmi, recall
 

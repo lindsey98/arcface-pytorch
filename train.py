@@ -1,6 +1,6 @@
 from __future__ import print_function
 import os
-from data import Dataset
+# from dataset
 import torch
 from torch.utils import data
 import torch.nn.functional as F
@@ -15,9 +15,14 @@ from config import Config
 from torch.nn import DataParallel
 from torch.optim.lr_scheduler import StepLR
 from test import *
+import  dataset
+from dataset import sampler
+from torch.utils.data.sampler import BatchSampler
+
 
 
 def save_model(model, save_path, name, iter_cnt):
+    os.makedirs(save_path, exist_ok=True)
     save_name = os.path.join(save_path, name + '_' + str(iter_cnt) + '.pth')
     torch.save(model.state_dict(), save_name)
     return save_name
@@ -30,40 +35,60 @@ if __name__ == '__main__':
         visualizer = Visualizer()
     device = torch.device("cuda")
 
-    train_dataset = Dataset(opt.train_root, opt.train_list, phase='train', input_shape=opt.input_shape)
-    trainloader = data.DataLoader(train_dataset,
-                                  batch_size=opt.train_batch_size,
-                                  shuffle=True,
-                                  num_workers=opt.num_workers)
+    trn_dataset = dataset.load(
+            name = opt.dataset,
+            root = opt.train_root,
+            mode = 'train',
+            transform = dataset.utils.make_transform(
+                is_train = True,
+                is_inception = (opt.backbone == 'bn_inception')
+            ))
+    balanced_sampler = sampler.BalancedSampler(trn_dataset, batch_size=opt.sz_batch, images_per_class = opt.IPC)
+    batch_sampler = BatchSampler(balanced_sampler, batch_size = opt.sz_batch, drop_last = True)
+    dl_tr = torch.utils.data.DataLoader(
+        trn_dataset,
+        num_workers = opt.nb_workers,
+        pin_memory = True,
+        batch_sampler = batch_sampler
+    )
 
-    identity_list = get_lfw_list(opt.lfw_test_list)
-    img_paths = [os.path.join(opt.lfw_root, each) for each in identity_list]
+    ev_dataset = dataset.load(
+        name=opt.dataset,
+        root=opt.test_root,
+        mode='eval',
+        transform=dataset.utils.make_transform(
+            is_train=False,
+            is_inception=(opt.backbone == 'bn_inception')
+        ))
 
-    print('{} train iters per epoch:'.format(len(trainloader)))
+    dl_ev = torch.utils.data.DataLoader(
+        ev_dataset,
+        batch_size=opt.sz_batch,
+        shuffle=False,
+        num_workers=opt.nb_workers,
+        pin_memory=True
+    )
+
+    print(len(dl_tr.dataset))
+    print(len(dl_ev.dataset))
 
     if opt.loss == 'focal_loss':
         criterion = FocalLoss(gamma=2)
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-    if opt.backbone == 'resnet18':
-        model = resnet_face18(use_se=opt.use_se)
-    elif opt.backbone == 'resnet34':
-        model = resnet34()
-    elif opt.backbone == 'resnet50':
-        model = resnet50()
+
+    model = resnet50()
 
     if opt.metric == 'add_margin':
-        metric_fc = AddMarginProduct(512, opt.num_classes, s=30, m=0.35)
+        metric_fc = AddMarginProduct(2048, opt.num_classes, s=30, m=0.35)
     elif opt.metric == 'arc_margin':
-        metric_fc = ArcMarginProduct(512, opt.num_classes, s=30, m=0.5, easy_margin=opt.easy_margin)
+        metric_fc = ArcMarginProduct(2048, opt.num_classes, s=30, m=0.5, easy_margin=opt.easy_margin)
     elif opt.metric == 'sphere':
-        metric_fc = SphereProduct(512, opt.num_classes, m=4)
+        metric_fc = SphereProduct(2048, opt.num_classes, m=4)
     else:
-        metric_fc = nn.Linear(512, opt.num_classes)
+        metric_fc = nn.Linear(2048, opt.num_classes)
 
-    # view_model(model, opt.input_shape)
-    print(model)
     model.to(device)
     model = DataParallel(model)
     metric_fc.to(device)
@@ -76,13 +101,13 @@ if __name__ == '__main__':
         optimizer = torch.optim.Adam([{'params': model.parameters()}, {'params': metric_fc.parameters()}],
                                      lr=opt.lr, weight_decay=opt.weight_decay)
     scheduler = StepLR(optimizer, step_size=opt.lr_step, gamma=0.1)
+    evaluate(model, dl_ev, eval_nmi=True, recall_list=[1, 2, 4, 8])
 
-    start = time.time()
     for i in range(opt.max_epoch):
         scheduler.step()
 
         model.train()
-        for ii, data in enumerate(trainloader):
+        for ii, data in tqdm(enumerate(dl_tr)):
             data_input, label = data
             data_input = data_input.to(device)
             label = label.to(device).long()
@@ -93,28 +118,13 @@ if __name__ == '__main__':
             loss.backward()
             optimizer.step()
 
-            iters = i * len(trainloader) + ii
+            iters = i * len(dl_tr) + ii
 
             if iters % opt.print_freq == 0:
-                output = output.data.cpu().numpy()
-                output = np.argmax(output, axis=1)
-                label = label.data.cpu().numpy()
-                # print(output)
-                # print(label)
-                acc = np.mean((output == label).astype(int))
-                speed = opt.print_freq / (time.time() - start)
-                time_str = time.asctime(time.localtime(time.time()))
-                print('{} train epoch {} iter {} {} iters/s loss {} acc {}'.format(time_str, i, ii, speed, loss.item(), acc))
-                if opt.display:
-                    visualizer.display_current_results(iters, loss.item(), name='train_loss')
-                    visualizer.display_current_results(iters, acc, name='train_acc')
-
-                start = time.time()
+                evaluate(model, dl_ev, eval_nmi=True, recall_list=[1, 2, 4, 8])
 
         if i % opt.save_interval == 0 or i == opt.max_epoch:
             save_model(model, opt.checkpoints_path, opt.backbone, i)
 
         model.eval()
-        acc = lfw_test(model, img_paths, identity_list, opt.lfw_test_list, opt.test_batch_size)
-        if opt.display:
-            visualizer.display_current_results(iters, acc, name='test_acc')
+        evaluate(model, dl_ev, eval_nmi=True, recall_list=[1, 2, 4, 8])
